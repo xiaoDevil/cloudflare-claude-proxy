@@ -70,14 +70,37 @@ const CONFIG = {
   },
 
   // 请求超时配置（毫秒）
-  timeout: 60000,
+  timeout: {
+    // 总超时时间（包括所有重试）
+    total: 60000,
+    // 单次请求超时
+    singleRequest: 30000,
+    // 连接超时（首字节超时）
+    connect: 10000,
+  },
 
   // 调试配置
   debug: {
     enabled: true, // 开启详细日志
-    logRequestBody: true, // 记录请求体
-    logResponseBody: true, // 记录响应体（仅非流式响应）
+    logLevel: 'INFO', // 日志级别: ERROR, WARN, INFO, DEBUG
+    logRequestBody: false, // 记录请求体（仅 DEBUG 级别，生产环境建议关闭）
+    logResponseBody: false, // 记录响应体（仅 DEBUG 级别，生产环境建议关闭）
     logRouting: true, // 记录路由信息
+  },
+
+  // 镜像选择策略
+  mirrorStrategy: 'primary-first', // 'sequential' | 'race' | 'primary-first'
+  // sequential: 串行尝试，失败后切换（省token但慢）
+  // race: 同时请求所有镜像，使用最快响应（快但消耗token）
+  // primary-first: 优先主站点，失败后并发所有备用镜像（推荐，平衡性能和token消耗）
+
+  // 镜像健康检查
+  healthCheck: {
+    enabled: true,
+    // 失败阈值：连续失败 N 次后标记为不健康
+    failureThreshold: 3,
+    // 熔断时间：不健康镜像的冷却时间（秒）
+    cooldownPeriod: 600, // 10 分钟
   },
 };
 
@@ -90,6 +113,116 @@ const HEADERS_TO_REMOVE = [
   'x-forwarded-proto',
   'x-real-ip',
 ];
+
+// 镜像健康状态（内存存储，重启后重置）
+const MIRROR_HEALTH = new Map();
+
+// 日志级别定义
+const LOG_LEVELS = {
+  ERROR: 0,
+  WARN: 1,
+  INFO: 2,
+  DEBUG: 3,
+};
+
+/**
+ * 分级日志函数
+ * @param {string} level - 日志级别
+ * @param {string} message - 日志消息
+ * @param  {...any} args - 额外参数
+ */
+function log(level, message, ...args) {
+  if (!CONFIG.debug.enabled) return;
+
+  const currentLevel = LOG_LEVELS[CONFIG.debug.logLevel] || LOG_LEVELS.INFO;
+  const messageLevel = LOG_LEVELS[level] || LOG_LEVELS.INFO;
+
+  if (messageLevel <= currentLevel) {
+    const timestamp = new Date().toISOString();
+    const prefix = `[${timestamp}] [${level}]`;
+    console.log(prefix, message, ...args);
+  }
+}
+
+/**
+ * 获取镜像健康状态
+ * @param {string} mirrorUrl - 镜像地址
+ */
+function getMirrorHealth(mirrorUrl) {
+  if (!CONFIG.healthCheck.enabled) {
+    return { healthy: true, failures: 0, lastCheck: null };
+  }
+
+  if (!MIRROR_HEALTH.has(mirrorUrl)) {
+    MIRROR_HEALTH.set(mirrorUrl, {
+      healthy: true,
+      failures: 0,
+      lastCheck: null,
+      cooldownUntil: null,
+    });
+  }
+
+  return MIRROR_HEALTH.get(mirrorUrl);
+}
+
+/**
+ * 更新镜像健康状态
+ * @param {string} mirrorUrl - 镜像地址
+ * @param {boolean} success - 请求是否成功
+ */
+function updateMirrorHealth(mirrorUrl, success) {
+  if (!CONFIG.healthCheck.enabled) return;
+
+  const health = getMirrorHealth(mirrorUrl);
+  health.lastCheck = Date.now();
+
+  if (success) {
+    // 成功则重置失败计数
+    health.failures = 0;
+    health.healthy = true;
+    health.cooldownUntil = null;
+    log('DEBUG', `镜像 ${mirrorUrl} 健康状态恢复`);
+  } else {
+    // 失败则增加计数
+    health.failures++;
+    log('WARN', `镜像 ${mirrorUrl} 失败次数: ${health.failures}`);
+
+    // 超过阈值标记为不健康
+    if (health.failures >= CONFIG.healthCheck.failureThreshold) {
+      health.healthy = false;
+      health.cooldownUntil = Date.now() + (CONFIG.healthCheck.cooldownPeriod * 1000);
+      log('ERROR', `镜像 ${mirrorUrl} 已标记为不健康，冷却至 ${new Date(health.cooldownUntil).toISOString()}`);
+    }
+  }
+
+  MIRROR_HEALTH.set(mirrorUrl, health);
+}
+
+/**
+ * 检查镜像是否可用
+ * @param {string} mirrorUrl - 镜像地址
+ */
+function isMirrorAvailable(mirrorUrl) {
+  if (!CONFIG.healthCheck.enabled) return true;
+
+  const health = getMirrorHealth(mirrorUrl);
+
+  // 如果在冷却期，检查是否已过期
+  if (!health.healthy && health.cooldownUntil) {
+    if (Date.now() > health.cooldownUntil) {
+      // 冷却期结束，重置状态
+      health.healthy = true;
+      health.failures = 0;
+      health.cooldownUntil = null;
+      MIRROR_HEALTH.set(mirrorUrl, health);
+      log('INFO', `镜像 ${mirrorUrl} 冷却期结束，重新启用`);
+      return true;
+    }
+    return false;
+  }
+
+  return health.healthy;
+}
 
 export default {
   async fetch(request, env, ctx) {
@@ -104,12 +237,12 @@ export default {
 
       // 调试日志：客户端信息
       if (CONFIG.debug.enabled && CONFIG.debug.logRouting) {
-        console.log('=== 客户端地理位置信息 ===');
-        console.log('国家/地区:', clientCountry);
-        console.log('省份/州:', clientRegion);
-        console.log('城市:', clientCity);
-        console.log('是否来自中国大陆/港澳台:', isFromChina);
-        console.log('路由策略:', CONFIG.routing.forceInternationalEgress ? '强制海外出口' : '自动选择');
+        log('INFO', '=== 客户端地理位置信息 ===');
+        log('INFO', '国家/地区:', clientCountry);
+        log('INFO', '省份/州:', clientRegion);
+        log('INFO', '城市:', clientCity);
+        log('INFO', '是否来自中国大陆/港澳台:', isFromChina);
+        log('INFO', '路由策略:', CONFIG.routing.forceInternationalEgress ? '强制海外出口' : '自动选择');
       }
 
       // 诊断端点：用于测试代理是否正常工作
@@ -238,17 +371,21 @@ export default {
 
       // 尝试从缓存获取（仅 GET 和 HEAD 请求）
       if (request.method === 'GET' || request.method === 'HEAD') {
-        const cache = caches.default;
-        const cachedResponse = await cache.match(request);
+        try {
+          const cache = caches.default;
+          const cachedResponse = await cache.match(request);
 
-        if (cachedResponse) {
-          const response = new Response(cachedResponse.body, cachedResponse);
-          response.headers.set('X-Cache-Status', 'HIT');
-          response.headers.set('X-Response-Time', `${Date.now() - startTime}ms`);
-          if (CONFIG.debug.enabled) {
-            console.log('缓存命中:', request.url);
+          if (cachedResponse) {
+            const response = new Response(cachedResponse.body, cachedResponse);
+            response.headers.set('X-Cache-Status', 'HIT');
+            response.headers.set('X-Response-Time', `${Date.now() - startTime}ms`);
+            log('INFO', '缓存命中:', request.url);
+            return response;
           }
-          return response;
+        } catch (cacheError) {
+          // 缓存读取失败不应阻止请求，记录错误后继续
+          log('ERROR', '缓存读取失败:', cacheError.message);
+          log('DEBUG', '继续处理原始请求');
         }
       }
 
@@ -271,12 +408,12 @@ export default {
       return response;
 
     } catch (error) {
-      console.error('=== 代理错误 ===');
-      console.error('错误类型:', error.name);
-      console.error('错误消息:', error.message);
-      console.error('错误堆栈:', error.stack);
-      console.error('请求 URL:', request.url);
-      console.error('请求方法:', request.method);
+      log('ERROR', '=== 代理错误 ===');
+      log('ERROR', '错误类型:', error.name);
+      log('ERROR', '错误消息:', error.message);
+      log('ERROR', '错误堆栈:', error.stack);
+      log('ERROR', '请求 URL:', request.url);
+      log('ERROR', '请求方法:', request.method);
 
       // 构建详细的错误响应
       const errorResponse = {
@@ -296,7 +433,7 @@ export default {
       // 如果是超时错误，提供更明确的信息
       if (error.name === 'AbortError') {
         errorResponse.message = '请求超时：目标服务器响应时间过长';
-        errorResponse.details.timeout = `${CONFIG.timeout}ms`;
+        errorResponse.details.timeout = `${CONFIG.timeout.singleRequest}ms`;
       }
 
       return new Response(
@@ -319,6 +456,231 @@ export default {
  * @param {boolean} isFromChina - 是否来自中国大陆/港澳台
  */
 async function proxyRequestWithMirrorFailover(request, isFromChina = false) {
+  // 根据配置选择镜像策略
+  if (CONFIG.mirrorStrategy === 'race') {
+    return proxyRequestRaceMode(request, isFromChina);
+  } else if (CONFIG.mirrorStrategy === 'primary-first') {
+    return proxyRequestPrimaryFirstMode(request, isFromChina);
+  } else {
+    return proxyRequestSequentialMode(request, isFromChina);
+  }
+}
+
+/**
+ * Primary-First 模式：优先尝试主站点，失败后并发所有备用镜像
+ * @param {Request} request - 原始请求
+ * @param {boolean} isFromChina - 是否来自中国大陆/港澳台
+ */
+async function proxyRequestPrimaryFirstMode(request, isFromChina = false) {
+  const primaryMirror = CONFIG.targetUrls[0];
+  const backupMirrors = CONFIG.targetUrls.slice(1);
+
+  log('INFO', '=== Primary-First 模式：优先主站点 ===');
+  log('INFO', '主站点:', primaryMirror);
+  log('INFO', '备用镜像数量:', backupMirrors.length);
+
+  // 第一步：尝试主站点
+  if (isMirrorAvailable(primaryMirror)) {
+    try {
+      log('INFO', '正在尝试主站点...');
+      const primaryResponse = await proxyRequestWithRetry(request.clone(), isFromChina, primaryMirror, 0);
+
+      // 检查响应状态是否需要故障转移
+      if (!CONFIG.mirror.autoFailover || !CONFIG.mirror.failoverStatuses.includes(primaryResponse.status)) {
+        // 主站点成功
+        updateMirrorHealth(primaryMirror, true);
+        log('INFO', '✓ 主站点响应成功');
+
+        const modifiedResponse = new Response(primaryResponse.body, primaryResponse);
+        modifiedResponse.headers.set('X-Mirror-Used', primaryMirror);
+        modifiedResponse.headers.set('X-Mirror-Index', '1');
+        modifiedResponse.headers.set('X-Mirror-Priority', 'primary');
+        modifiedResponse.headers.set('X-Mirror-Strategy', 'primary-first');
+
+        return modifiedResponse;
+      } else {
+        // 主站点返回错误状态码
+        log('WARN', `主站点返回错误状态 ${primaryResponse.status}，切换到备用镜像`);
+        updateMirrorHealth(primaryMirror, false);
+      }
+    } catch (error) {
+      // 主站点请求失败
+      log('WARN', `主站点请求失败: ${error.message}`);
+      updateMirrorHealth(primaryMirror, false);
+    }
+  } else {
+    log('WARN', '主站点不健康，跳过');
+  }
+
+  // 第二步：主站点失败，并发所有备用镜像
+  if (backupMirrors.length === 0) {
+    throw new Error('主站点失败且无备用镜像可用');
+  }
+
+  log('INFO', `主站点不可用，并发请求 ${backupMirrors.length} 个备用镜像...`);
+
+  // 过滤出可用的备用镜像
+  const availableBackups = backupMirrors.filter((url, index) => {
+    const available = isMirrorAvailable(url);
+    if (!available) {
+      log('WARN', `备用镜像 ${index + 2} (${url}) 不健康，跳过`);
+    }
+    return available;
+  });
+
+  if (availableBackups.length === 0) {
+    log('WARN', '所有备用镜像不健康，尝试使用所有镜像');
+    availableBackups.push(...backupMirrors);
+  }
+
+  // 并发请求所有可用的备用镜像
+  const backupPromises = availableBackups.map((targetUrl) => {
+    return proxyRequestWithRetry(request.clone(), isFromChina, targetUrl, 0)
+      .then(response => {
+        updateMirrorHealth(targetUrl, true);
+
+        const mirrorIndex = CONFIG.targetUrls.indexOf(targetUrl);
+        log('INFO', `✓ 备用镜像 ${mirrorIndex + 1} 响应成功 (${targetUrl})`);
+
+        const modifiedResponse = new Response(response.body, response);
+        modifiedResponse.headers.set('X-Mirror-Used', targetUrl);
+        modifiedResponse.headers.set('X-Mirror-Index', String(mirrorIndex + 1));
+        modifiedResponse.headers.set('X-Mirror-Priority', 'backup');
+        modifiedResponse.headers.set('X-Mirror-Strategy', 'primary-first');
+
+        return { success: true, response: modifiedResponse, mirror: targetUrl };
+      })
+      .catch(error => {
+        updateMirrorHealth(targetUrl, false);
+        const mirrorIndex = CONFIG.targetUrls.indexOf(targetUrl);
+        log('WARN', `备用镜像 ${mirrorIndex + 1} (${targetUrl}) 请求失败: ${error.message}`);
+        return { success: false, error: error.message, mirror: targetUrl };
+      });
+  });
+
+  try {
+    // 使用 Promise.race 获取第一个完成的备用镜像
+    const result = await Promise.race(backupPromises);
+
+    if (result.success) {
+      return result.response;
+    }
+
+    // 第一个响应失败，等待其他备用镜像
+    log('WARN', '第一个备用镜像响应失败，等待其他镜像');
+    const allResults = await Promise.allSettled(backupPromises);
+
+    // 查找第一个成功的响应
+    for (const settledResult of allResults) {
+      if (settledResult.status === 'fulfilled' && settledResult.value.success) {
+        return settledResult.value.response;
+      }
+    }
+
+    // 所有备用镜像都失败
+    log('ERROR', `所有镜像（包括主站点和 ${availableBackups.length} 个备用镜像）均失败`);
+    throw new Error(`所有镜像均不可达。主站点和 ${availableBackups.length} 个备用镜像都失败了`);
+
+  } catch (error) {
+    log('ERROR', 'Primary-First 模式请求失败:', error.message);
+    throw error;
+  }
+}
+
+/**
+ * Race 模式：并行请求多个镜像，使用最快响应
+ * @param {Request} request - 原始请求
+ * @param {boolean} isFromChina - 是否来自中国大陆/港澳台
+ */
+async function proxyRequestRaceMode(request, isFromChina = false) {
+  log('INFO', `=== Race 模式：并行请求 ${CONFIG.targetUrls.length} 个镜像 ===`);
+
+  // 过滤出可用的镜像
+  const availableMirrors = CONFIG.targetUrls.filter((url, index) => {
+    const available = isMirrorAvailable(url);
+    if (!available) {
+      log('WARN', `镜像 ${index + 1} (${url}) 不健康，跳过`);
+    }
+    return available;
+  });
+
+  if (availableMirrors.length === 0) {
+    log('ERROR', '所有镜像均不可用，尝试所有镜像');
+    // 如果所有镜像都不健康，仍然尝试所有镜像（可能已过冷却期）
+    availableMirrors.push(...CONFIG.targetUrls);
+  }
+
+  log('INFO', `可用镜像数量: ${availableMirrors.length}`);
+
+  // 为每个镜像创建请求 Promise
+  const racePromises = availableMirrors.map((targetUrl, index) => {
+    return proxyRequestWithRetry(request.clone(), isFromChina, targetUrl, 0)
+      .then(response => {
+        // 成功响应
+        updateMirrorHealth(targetUrl, true);
+
+        const mirrorIndex = CONFIG.targetUrls.indexOf(targetUrl);
+        const isPrimary = mirrorIndex === 0;
+
+        log('INFO', `✓ 镜像 ${mirrorIndex + 1} 响应成功 (${targetUrl})`);
+
+        // 添加镜像信息头
+        const modifiedResponse = new Response(response.body, response);
+        modifiedResponse.headers.set('X-Mirror-Used', targetUrl);
+        modifiedResponse.headers.set('X-Mirror-Index', String(mirrorIndex + 1));
+        modifiedResponse.headers.set('X-Mirror-Priority', isPrimary ? 'primary' : 'backup');
+        modifiedResponse.headers.set('X-Mirror-Strategy', 'race');
+
+        return { success: true, response: modifiedResponse, mirror: targetUrl };
+      })
+      .catch(error => {
+        // 失败响应
+        updateMirrorHealth(targetUrl, false);
+        log('WARN', `镜像 ${index + 1} (${targetUrl}) 请求失败: ${error.message}`);
+        return { success: false, error: error.message, mirror: targetUrl };
+      });
+  });
+
+  try {
+    // Promise.race 返回第一个完成的 Promise（无论成功还是失败）
+    // 我们需要第一个成功的响应
+    const result = await Promise.race(racePromises);
+
+    if (result.success) {
+      return result.response;
+    }
+
+    // 如果第一个响应失败，等待其他响应
+    log('WARN', '第一个响应失败，等待其他镜像');
+    const allResults = await Promise.allSettled(racePromises);
+
+    // 查找第一个成功的响应
+    for (const settledResult of allResults) {
+      if (settledResult.status === 'fulfilled' && settledResult.value.success) {
+        return settledResult.value.response;
+      }
+    }
+
+    // 所有镜像都失败
+    const errors = allResults
+      .filter(r => r.status === 'fulfilled' && !r.value.success)
+      .map(r => r.value);
+
+    log('ERROR', `所有 ${availableMirrors.length} 个镜像均失败`);
+    throw new Error(`所有镜像均不可达。尝试了 ${availableMirrors.length} 个镜像`);
+
+  } catch (error) {
+    log('ERROR', 'Race 模式请求失败:', error.message);
+    throw error;
+  }
+}
+
+/**
+ * Sequential 模式：串行尝试镜像，失败后切换
+ * @param {Request} request - 原始请求
+ * @param {boolean} isFromChina - 是否来自中国大陆/港澳台
+ */
+async function proxyRequestSequentialMode(request, isFromChina = false) {
   const errors = [];
 
   // 遍历所有镜像地址
@@ -326,51 +688,59 @@ async function proxyRequestWithMirrorFailover(request, isFromChina = false) {
     const currentTargetUrl = CONFIG.targetUrls[mirrorIndex];
     const isPrimary = mirrorIndex === 0;
 
+    // 检查镜像是否可用
+    if (!isMirrorAvailable(currentTargetUrl)) {
+      log('WARN', `镜像 ${mirrorIndex + 1} (${currentTargetUrl}) 不健康，跳过`);
+      errors.push({ mirror: currentTargetUrl, error: '镜像不健康，在冷却期', skipped: true });
+      continue;
+    }
+
     try {
-      if (CONFIG.debug.enabled) {
-        console.log(`=== 尝试镜像 ${mirrorIndex + 1}/${CONFIG.targetUrls.length} ===`);
-        console.log('镜像地址:', currentTargetUrl);
-        console.log('优先级:', isPrimary ? '主站点' : `备用镜像 ${mirrorIndex}`);
-      }
+      log('INFO', `=== 尝试镜像 ${mirrorIndex + 1}/${CONFIG.targetUrls.length} ===`);
+      log('DEBUG', '镜像地址:', currentTargetUrl);
+      log('DEBUG', '优先级:', isPrimary ? '主站点' : `备用镜像 ${mirrorIndex}`);
 
       // 使用当前镜像发起请求（带重试）
-      const response = await proxyRequestWithRetry(request, isFromChina, currentTargetUrl, 0);
+      const response = await proxyRequestWithRetry(request.clone(), isFromChina, currentTargetUrl, 0);
 
       // 检查响应状态是否需要故障转移
       if (CONFIG.mirror.autoFailover && CONFIG.mirror.failoverStatuses.includes(response.status)) {
         const errorMsg = `镜像 ${mirrorIndex + 1} 返回错误状态 ${response.status}`;
-        console.warn(errorMsg);
+        log('WARN', errorMsg);
         errors.push({ mirror: currentTargetUrl, error: errorMsg, status: response.status });
+        updateMirrorHealth(currentTargetUrl, false);
 
         // 如果不是最后一个镜像，继续尝试下一个
         if (mirrorIndex < CONFIG.targetUrls.length - 1) {
-          console.log('切换到下一个镜像...');
+          log('INFO', '切换到下一个镜像...');
           continue;
         }
       }
 
-      // 成功响应，添加使用的镜像信息
+      // 成功响应
+      updateMirrorHealth(currentTargetUrl, true);
+
       const modifiedResponse = new Response(response.body, response);
       modifiedResponse.headers.set('X-Mirror-Used', currentTargetUrl);
       modifiedResponse.headers.set('X-Mirror-Index', String(mirrorIndex + 1));
       modifiedResponse.headers.set('X-Mirror-Priority', isPrimary ? 'primary' : 'backup');
+      modifiedResponse.headers.set('X-Mirror-Strategy', 'sequential');
 
-      if (CONFIG.debug.enabled) {
-        console.log(`✓ 镜像 ${mirrorIndex + 1} 响应成功`);
-      }
+      log('INFO', `✓ 镜像 ${mirrorIndex + 1} 响应成功`);
 
       return modifiedResponse;
 
     } catch (error) {
       const errorMsg = `镜像 ${mirrorIndex + 1} 请求失败: ${error.message}`;
-      console.error(errorMsg);
+      log('ERROR', errorMsg);
       errors.push({ mirror: currentTargetUrl, error: errorMsg, type: error.name });
+      updateMirrorHealth(currentTargetUrl, false);
 
       // 如果是最后一个镜像，抛出错误
       if (mirrorIndex === CONFIG.targetUrls.length - 1) {
-        console.error('=== 所有镜像均失败 ===');
+        log('ERROR', '=== 所有镜像均失败 ===');
         errors.forEach((e, i) => {
-          console.error(`镜像 ${i + 1}:`, e.mirror, '-', e.error);
+          log('ERROR', `镜像 ${i + 1}:`, e.mirror, '-', e.error);
         });
 
         // 返回详细的错误信息
@@ -380,7 +750,7 @@ async function proxyRequestWithMirrorFailover(request, isFromChina = false) {
       }
 
       // 继续尝试下一个镜像
-      console.log(`切换到镜像 ${mirrorIndex + 2}...`);
+      log('INFO', `切换到镜像 ${mirrorIndex + 2}...`);
     }
   }
 
@@ -405,12 +775,12 @@ async function proxyRequestWithRetry(request, isFromChina = false, targetUrlStri
 
     // 调试日志：记录请求信息
     if (CONFIG.debug.enabled) {
-      console.log('=== 代理请求开始 ===');
-      console.log('请求方法:', request.method);
-      console.log('原始 URL:', request.url);
-      console.log('目标 URL:', targetUrl.toString());
-      console.log('重试次数:', retryCount);
-      console.log('来自中国:', isFromChina);
+      log('DEBUG', '=== 代理请求开始 ===');
+      log('DEBUG', '请求方法:', request.method);
+      log('DEBUG', '原始 URL:', request.url);
+      log('DEBUG', '目标 URL:', targetUrl.toString());
+      log('DEBUG', '重试次数:', retryCount);
+      log('DEBUG', '来自中国:', isFromChina);
     }
 
     // 构建请求头
@@ -418,7 +788,7 @@ async function proxyRequestWithRetry(request, isFromChina = false, targetUrlStri
 
     // 调试日志：记录请求头
     if (CONFIG.debug.enabled) {
-      console.log('请求头:', Object.fromEntries(headers.entries()));
+      log('DEBUG', '请求头:', Object.fromEntries(headers.entries()));
     }
 
     // 构建请求配置
@@ -452,47 +822,43 @@ async function proxyRequestWithRetry(request, isFromChina = false, targetUrlStri
     if (['POST', 'PUT', 'PATCH'].includes(request.method)) {
       const contentType = request.headers.get('content-type') || '';
 
-      // 调试日志：记录 Content-Type
-      if (CONFIG.debug.enabled) {
-        console.log('Content-Type:', contentType);
-      }
+      log('DEBUG', 'Content-Type:', contentType);
 
       // 检查是否是流式请求（SSE）
       if (contentType.includes('text/event-stream') || contentType.includes('application/stream')) {
         // 流式请求直接传递 body
         proxyInit.body = request.body;
-        if (CONFIG.debug.enabled) {
-          console.log('检测到流式请求，直接传递 body');
-        }
+        log('DEBUG', '检测到流式请求，直接传递 body');
       } else {
-        // 非流式请求：读取并记录请求体
-        try {
-          const clonedRequest = request.clone();
-          const bodyText = await clonedRequest.text();
+        // 非流式请求
+        // 优化：仅在需要记录日志时才读取请求体，否则直接传递
+        if (CONFIG.debug.logRequestBody && LOG_LEVELS[CONFIG.debug.logLevel] >= LOG_LEVELS.DEBUG) {
+          try {
+            const clonedRequest = request.clone();
+            const bodyText = await clonedRequest.text();
 
-          // 调试日志：记录请求体
-          if (CONFIG.debug.enabled && CONFIG.debug.logRequestBody) {
-            console.log('请求体长度:', bodyText.length);
-            console.log('请求体内容:', bodyText.substring(0, 1000)); // 只显示前1000字符
+            log('DEBUG', '请求体长度:', bodyText.length);
+            log('DEBUG', '请求体内容:', bodyText.substring(0, 500)); // 只显示前500字符
+
+            // 重新赋值请求体
+            proxyInit.body = bodyText;
+          } catch (bodyError) {
+            log('ERROR', '读取请求体失败:', bodyError.message);
+            // 降级方案：使用原始 body
+            proxyInit.body = request.body;
           }
-
-          // 重新赋值请求体
-          proxyInit.body = bodyText;
-        } catch (bodyError) {
-          console.error('读取请求体失败:', bodyError);
-          // 降级方案：使用 arrayBuffer
-          proxyInit.body = await request.clone().arrayBuffer();
+        } else {
+          // 生产环境直接传递 body，不读取到内存
+          proxyInit.body = request.body;
         }
       }
     }
 
-    // 发送请求
+    // 发送请求（带超时控制）
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), CONFIG.timeout);
+    const timeoutId = setTimeout(() => controller.abort(), CONFIG.timeout.singleRequest);
 
-    if (CONFIG.debug.enabled) {
-      console.log('发送请求到目标服务器...');
-    }
+    log('DEBUG', '发送请求到目标服务器...');
 
     const response = await fetch(targetUrl.toString(), {
       ...proxyInit,
@@ -503,9 +869,9 @@ async function proxyRequestWithRetry(request, isFromChina = false, targetUrlStri
 
     // 调试日志：记录响应信息
     if (CONFIG.debug.enabled) {
-      console.log('=== 收到响应 ===');
-      console.log('响应状态:', response.status, response.statusText);
-      console.log('响应头:', Object.fromEntries(response.headers.entries()));
+      log('DEBUG', '=== 收到响应 ===');
+      log('DEBUG', '响应状态:', response.status, response.statusText);
+      log('DEBUG', '响应头:', Object.fromEntries(response.headers.entries()));
     }
 
     // 检查是否需要重试
@@ -513,28 +879,28 @@ async function proxyRequestWithRetry(request, isFromChina = false, targetUrlStri
       CONFIG.retry.retryableStatuses.includes(response.status) &&
       retryCount < CONFIG.retry.maxRetries
     ) {
-      console.log(`服务器返回 ${response.status}，重试中 (${retryCount + 1}/${CONFIG.retry.maxRetries})...`);
+      log('WARN', `服务器返回 ${response.status}，重试中 (${retryCount + 1}/${CONFIG.retry.maxRetries})...`);
       await sleep(CONFIG.retry.retryDelay);
       return proxyRequestWithRetry(request, isFromChina, targetUrlString, retryCount + 1);
     }
 
     // 调试日志：路由成功
     if (CONFIG.debug.enabled && CONFIG.debug.logRouting) {
-      console.log('=== 路由成功 ===');
-      console.log('使用海外节点:', isFromChina && CONFIG.routing.forceInternationalEgress);
-      console.log('响应状态:', response.status);
+      log('INFO', '=== 路由成功 ===');
+      log('INFO', '使用海外节点:', isFromChina && CONFIG.routing.forceInternationalEgress);
+      log('INFO', '响应状态:', response.status);
     }
 
     // 构建响应
     return buildProxyResponse(response);
 
   } catch (error) {
-    console.error('代理请求异常:', error.message);
-    console.error('错误堆栈:', error.stack);
+    log('ERROR', '代理请求异常:', error.message);
+    log('DEBUG', '错误堆栈:', error.stack);
 
     // 重试逻辑
     if (retryCount < CONFIG.retry.maxRetries) {
-      console.log(`请求失败，重试中 (${retryCount + 1}/${CONFIG.retry.maxRetries})...`);
+      log('INFO', `请求失败，重试中 (${retryCount + 1}/${CONFIG.retry.maxRetries})...`);
       await sleep(CONFIG.retry.retryDelay);
       return proxyRequestWithRetry(request, isFromChina, targetUrlString, retryCount + 1);
     }
@@ -588,29 +954,29 @@ async function buildProxyResponse(response) {
 
   // 调试日志：记录响应类型
   if (CONFIG.debug.enabled) {
-    console.log('响应类型:', isStream ? '流式响应' : '普通响应');
-    console.log('Content-Type:', contentType);
+    log('DEBUG', '响应类型:', isStream ? '流式响应' : '普通响应');
+    log('DEBUG', 'Content-Type:', contentType);
   }
 
   // 对于非流式响应，记录响应体（用于调试）
   let responseBody = response.body;
-  if (CONFIG.debug.enabled && CONFIG.debug.logResponseBody && !isStream) {
+  if (CONFIG.debug.logResponseBody && !isStream && LOG_LEVELS[CONFIG.debug.logLevel] >= LOG_LEVELS.DEBUG) {
     try {
       const clonedResponse = response.clone();
       const bodyText = await clonedResponse.text();
-      console.log('响应体长度:', bodyText.length);
-      console.log('响应体内容:', bodyText.substring(0, 1000)); // 只显示前1000字符
+      log('DEBUG', '响应体长度:', bodyText.length);
+      log('DEBUG', '响应体内容:', bodyText.substring(0, 500)); // 只显示前500字符
 
       // 尝试解析 JSON 验证格式
       try {
         const jsonBody = JSON.parse(bodyText);
-        console.log('响应体 JSON 解析成功');
-        console.log('JSON 键:', Object.keys(jsonBody));
+        log('DEBUG', '响应体 JSON 解析成功');
+        log('DEBUG', 'JSON 键:', Object.keys(jsonBody));
       } catch (jsonError) {
-        console.log('响应体不是有效的 JSON 格式');
+        log('DEBUG', '响应体不是有效的 JSON 格式');
       }
     } catch (logError) {
-      console.error('记录响应体时出错:', logError.message);
+      log('ERROR', '记录响应体时出错:', logError.message);
     }
   }
 
@@ -637,9 +1003,7 @@ async function buildProxyResponse(response) {
     modifiedResponse.headers.set('X-Accel-Buffering', 'no');
   }
 
-  if (CONFIG.debug.enabled) {
-    console.log('=== 代理响应构建完成 ===');
-  }
+  log('DEBUG', '=== 代理响应构建完成 ===');
 
   return modifiedResponse;
 }
@@ -675,6 +1039,8 @@ function shouldCache(request, response) {
 
 /**
  * 缓存响应并设置 TTL
+ * @param {Request} request - 原始请求
+ * @param {Response} response - 响应对象
  */
 async function cacheWithTTL(request, response) {
   try {
@@ -685,10 +1051,35 @@ async function cacheWithTTL(request, response) {
     // 设置缓存控制头
     response.headers.set('Cache-Control', `public, max-age=${ttl}`);
 
+    // 添加 Vary 头支持，确保根据这些头的不同值分别缓存
+    const varyHeaders = [
+      'Accept-Language',
+      'Accept-Encoding',
+      'Authorization', // 如果有认证头，分别缓存
+    ];
+
+    // 检查原响应是否已有 Vary 头
+    const existingVary = response.headers.get('Vary');
+    if (existingVary) {
+      // 合并已有的 Vary 头
+      const combined = new Set([...existingVary.split(',').map(v => v.trim()), ...varyHeaders]);
+      response.headers.set('Vary', Array.from(combined).join(', '));
+    } else {
+      // 只为有意义的请求添加 Vary 头
+      const relevantVaryHeaders = varyHeaders.filter(header => request.headers.has(header));
+      if (relevantVaryHeaders.length > 0) {
+        response.headers.set('Vary', relevantVaryHeaders.join(', '));
+      }
+    }
+
+    // 添加缓存时间戳
+    response.headers.set('X-Cache-Date', new Date().toISOString());
+
     const cache = caches.default;
     await cache.put(request, response);
+    log('DEBUG', `已缓存响应: ${url.pathname} (TTL: ${ttl}s)`);
   } catch (error) {
-    console.error('Cache error:', error);
+    log('ERROR', '缓存写入失败:', error.message);
   }
 }
 
