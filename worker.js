@@ -89,7 +89,7 @@ const CONFIG = {
   },
 
   // 镜像选择策略
-  mirrorStrategy: 'primary-first', // 'sequential' | 'race' | 'primary-first'
+  mirrorStrategy: 'race', // 'sequential' | 'race' | 'primary-first'
   // sequential: 串行尝试，失败后切换（省token但慢）
   // race: 同时请求所有镜像，使用最快响应（快但消耗token）
   // primary-first: 优先主站点，失败后并发所有备用镜像（推荐，平衡性能和token消耗）
