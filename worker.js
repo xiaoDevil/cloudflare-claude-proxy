@@ -26,7 +26,6 @@ const CONFIG = {
   // 目标中转站地址（多镜像支持，按优先级排序）
   targetUrls: [
     'https://anyrouter.top',                                 // 主站点（优先）
-    'https://c.cspok.cn',                                    // 备用镜像 1
     'https://pmpjfbhq.cn-nb1.rainapp.top',                   // 备用镜像 2
     'https://a-ocnfniawgw.cn-shanghai.fcapp.run',            // 备用镜像 3
   ],
